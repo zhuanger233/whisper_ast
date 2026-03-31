@@ -1,4 +1,5 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from pydantic import BaseModel, Field
 import shutil
 import uuid
 import os
@@ -12,17 +13,38 @@ from s3_client import upload_file, generate_presigned_url
 app = FastAPI()
 
 
+class JobCreateRequest(BaseModel):
+    filename: str = Field(..., min_length=1)
+    target_language: str = Field(..., min_length=2, max_length=10)
+    translate: bool = False
+
+
 @app.post("/jobs")
-async def create_job():
+async def create_job(payload: JobCreateRequest):
     job_id = f"job_{uuid.uuid4().hex}"
     set_job(job_id, {
-        "status": "created"
+        "status": "created",
+        "filename": payload.filename,
+        "target_language": payload.target_language,
+        "translate": payload.translate
     })
-    return {"job_id": job_id}
+    return {
+        "job_id": job_id,
+        "filename": payload.filename,
+        "target_language": payload.target_language,
+        "translate": payload.translate
+    }
 
 
 @app.post("/jobs/{job_id}/upload")
 async def upload(job_id: str, file: UploadFile = File(...)):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+    expected_filename = job.get("filename")
+    if expected_filename and file.filename != expected_filename:
+        raise HTTPException(status_code=400, detail="filename mismatch")
+
     local_path = f"/tmp/{job_id}_{file.filename}"
 
     # 临时保存
@@ -40,7 +62,15 @@ async def upload(job_id: str, file: UploadFile = File(...)):
     os.remove(local_path)
 
     # 提交任务
-    task = transcribe_task.delay(job_id, s3_key, model)
+    translate = bool(job.get("translate", False))
+    target_language = job.get("target_language")
+    task = transcribe_task.delay(
+        job_id,
+        s3_key,
+        model,
+        translate=translate,
+        target_language=target_language
+    )
 
     set_job(job_id, {
         "status": "queued",
@@ -51,7 +81,9 @@ async def upload(job_id: str, file: UploadFile = File(...)):
 
     return {
         "job_id": job_id,
-        "model": model
+        "model": model,
+        "target_language": target_language,
+        "translate": translate
     }
 
 

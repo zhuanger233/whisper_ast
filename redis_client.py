@@ -7,7 +7,10 @@ redis_client = redis.Redis.from_url(
     decode_responses=True
 )
 
-def set_job(job_id: str, data: dict):
+def set_job(job_id: str, data: dict, merge: bool = True):
+    if merge:
+        existing = get_job(job_id) or {}
+        data = {**existing, **data}
     redis_client.set(f"job:{job_id}", json.dumps(data))
 
 
