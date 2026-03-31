@@ -1,0 +1,10 @@
+openai-whisper
+torch
+torchaudio
+ffmpeg-python
+fastapi
+uvicorn
+celery
+redis
+python-multipart
+boto3
