@@ -1,5 +1,5 @@
 openai-whisper
-openai
+boto3
 torch
 torchaudio
 ffmpeg-python

@@ -3,7 +3,8 @@ import json
 import re
 import logging
 import whisper
-from openai import OpenAI
+import boto3
+from botocore.exceptions import ClientError
 from worker import celery
 from scheduler import acquire_slot, release_slot
 from utils import generate_srt, split_audio, merge_segments, get_audio_duration
@@ -34,12 +35,24 @@ def _extract_json_array(text: str):
     return json.loads(text[start:end + 1])
 
 
-def translate_segments_openai(segments, target_language: str):
-    client = OpenAI()
+def _get_bedrock_client():
+    region = os.getenv("BEDROCK_REGION") or os.getenv("AWS_REGION") or "us-west-2"
+    return boto3.client("bedrock-runtime", region_name=region)
+
+
+def translate_segments_bedrock(segments, target_language: str):
+    client = _get_bedrock_client()
     translated = []
     batch_size = 50
 
-    logger.info("openai_translate_start target_language=%s segments=%d", target_language, len(segments))
+    logger.info("bedrock_translate_start target_language=%s segments=%d", target_language, len(segments))
+
+    model_id = os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-3-5-haiku-20241022-v1:0")
+    anthropic_version = os.getenv("BEDROCK_ANTHROPIC_VERSION", "bedrock-2023-05-31")
+    temperature = float(os.getenv("BEDROCK_TEMPERATURE", "0.2"))
+    top_p = float(os.getenv("BEDROCK_TOP_P", "0.8"))
+    top_k = int(os.getenv("BEDROCK_TOP_K", "80"))
+    max_tokens = int(os.getenv("BEDROCK_MAX_TOKENS", "2048"))
 
     for i in range(0, len(segments), batch_size):
         batch = segments[i:i + batch_size]
@@ -47,37 +60,46 @@ def translate_segments_openai(segments, target_language: str):
         input_json = json.dumps(items, ensure_ascii=False)
 
         try:
-            response = client.responses.create(
-                model="gpt-4o-mini",
-                input=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a subtitle translation engine. "
-                            "Translate each item to the target language. "
-                            "Return ONLY a JSON array of strings in the same order, "
-                            "with no extra text."
-                        )
-                    },
+            prompt = (
+                "You are a subtitle translation engine. "
+                "Translate each item to the target language. "
+                "Return ONLY a JSON array of strings in the same order, with no extra text.\n"
+                f"Target language: {target_language}\n"
+                f"Input JSON:\n{input_json}"
+            )
+            native_request = {
+                "anthropic_version": anthropic_version,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "top_p": top_p,
+                "top_k": top_k,
+                "messages": [
                     {
                         "role": "user",
-                        "content": f"Target language: {target_language}\nInput JSON:\n{input_json}"
+                        "content": [{"type": "text", "text": prompt}],
                     }
-                ]
+                ],
+            }
+            response = client.invoke_model(
+                modelId=model_id,
+                body=json.dumps(native_request),
+                contentType="application/json",
+                accept="application/json",
             )
-        except Exception as e:
-            logger.exception("openai_translate_error batch_start=%d batch_size=%d", i, len(batch))
+        except (ClientError, Exception) as e:
+            logger.exception("bedrock_translate_error batch_start=%d batch_size=%d", i, len(batch))
             raise e
 
-        output_text = getattr(response, "output_text", None)
+        model_response = json.loads(response["body"].read())
+        output_text = model_response["content"][0]["text"]
         snippet = (output_text[:200] + "...") if output_text and len(output_text) > 200 else output_text
         logger.info(
-            "openai_translate_response batch_start=%d batch_size=%d output_text_len=%s snippet=%s",
+            "bedrock_translate_response batch_start=%d batch_size=%d output_text_len=%s snippet=%s",
             i, len(batch), (len(output_text) if output_text else "None"), snippet
         )
 
         if not output_text:
-            raise ValueError("Empty OpenAI response output_text")
+            raise ValueError("Empty Bedrock response output_text")
 
         translated_texts = _extract_json_array(output_text)
         if len(translated_texts) != len(batch):
@@ -141,8 +163,8 @@ def transcribe_task(self, job_id, s3_key, model_name, translate=False, target_la
         # =========================
         if translate:
             if target_language and target_language.lower() != "en":
-                set_job(job_id, {"status": "translating_openai"})
-                segments = translate_segments_openai(segments, target_language)
+                set_job(job_id, {"status": "translating_bedrock"})
+                segments = translate_segments_bedrock(segments, target_language)
             else:
                 if not target_language:
                     logger.info("translate_fallback_whisper_no_target_language job_id=%s", job_id)
