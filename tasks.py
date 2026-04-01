@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import logging
 import whisper
 from openai import OpenAI
 from worker import celery
@@ -10,6 +11,8 @@ from redis_client import set_job
 from s3_client import download_file, upload_file
 
 models = {}
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger(__name__)
 
 
 def get_model(name):
@@ -36,31 +39,46 @@ def translate_segments_openai(segments, target_language: str):
     translated = []
     batch_size = 50
 
+    logger.info("openai_translate_start target_language=%s segments=%d", target_language, len(segments))
+
     for i in range(0, len(segments), batch_size):
         batch = segments[i:i + batch_size]
         items = [{"text": s["text"]} for s in batch]
         input_json = json.dumps(items, ensure_ascii=False)
 
-        response = client.responses.create(
-            model="gpt-4o-mini",
-            input=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a subtitle translation engine. "
-                        "Translate each item to the target language. "
-                        "Return ONLY a JSON array of strings in the same order, "
-                        "with no extra text."
-                    )
-                },
-                {
-                    "role": "user",
-                    "content": f"Target language: {target_language}\nInput JSON:\n{input_json}"
-                }
-            ]
+        try:
+            response = client.responses.create(
+                model="gpt-4o-mini",
+                input=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a subtitle translation engine. "
+                            "Translate each item to the target language. "
+                            "Return ONLY a JSON array of strings in the same order, "
+                            "with no extra text."
+                        )
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Target language: {target_language}\nInput JSON:\n{input_json}"
+                    }
+                ]
+            )
+        except Exception as e:
+            logger.exception("openai_translate_error batch_start=%d batch_size=%d", i, len(batch))
+            raise e
+
+        output_text = getattr(response, "output_text", None)
+        snippet = (output_text[:200] + "...") if output_text and len(output_text) > 200 else output_text
+        logger.info(
+            "openai_translate_response batch_start=%d batch_size=%d output_text_len=%s snippet=%s",
+            i, len(batch), (len(output_text) if output_text else "None"), snippet
         )
 
-        output_text = response.output_text
+        if not output_text:
+            raise ValueError("Empty OpenAI response output_text")
+
         translated_texts = _extract_json_array(output_text)
         if len(translated_texts) != len(batch):
             raise ValueError("Translated items count mismatch")
@@ -91,6 +109,10 @@ def transcribe_task(self, job_id, s3_key, model_name, translate=False, target_la
         download_file(s3_key, local_path)
 
         duration = get_audio_duration(local_path)
+        logger.info(
+            "job_start job_id=%s translate=%s target_language=%s duration=%.2f",
+            job_id, translate, target_language, duration
+        )
         model = get_model(model_name)
 
         # =========================
@@ -122,6 +144,10 @@ def transcribe_task(self, job_id, s3_key, model_name, translate=False, target_la
                 set_job(job_id, {"status": "translating_openai"})
                 segments = translate_segments_openai(segments, target_language)
             else:
+                if not target_language:
+                    logger.info("translate_fallback_whisper_no_target_language job_id=%s", job_id)
+                else:
+                    logger.info("translate_whisper_en job_id=%s target_language=%s", job_id, target_language)
                 set_job(job_id, {"status": "translating"})
                 result = model.transcribe(local_path, task="translate")
                 segments = result["segments"]
