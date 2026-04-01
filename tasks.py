@@ -47,7 +47,7 @@ def translate_segments_bedrock(segments, target_language: str):
 
     logger.info("bedrock_translate_start target_language=%s segments=%d", target_language, len(segments))
 
-    model_id = os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-3-5-haiku-20241022-v1:0")
+    model_id = os.getenv("BEDROCK_MODEL_ID", "us.anthropic.claude-3-5-haiku-20241022-v1:0")
     anthropic_version = os.getenv("BEDROCK_ANTHROPIC_VERSION", "bedrock-2023-05-31")
     temperature = float(os.getenv("BEDROCK_TEMPERATURE", "0.2"))
     top_p = float(os.getenv("BEDROCK_TOP_P", "0.8"))
